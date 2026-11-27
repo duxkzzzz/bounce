@@ -1,0 +1,224 @@
+print(1)
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+
+local CONFIG = {
+	MinFallSpeed = 1,
+	MinImpactSpeed = 4.5,
+	Restitution = 0.6,
+	MaxSpeedGain = 1.06,
+	MaxBounceHeight = 2.5,
+	MinVerticalSpeed = 1.25,
+	ContactTolerance = 0.25,
+	ContactNormalSlack = 2,
+	ProbeSpread = 0.65,
+	MinRampAngle = 0.5,
+	MaxRampAngle = 84,
+	Cooldown = 0.09,
+}
+
+type Pending = {
+	out: Vector3,
+	normal: Vector3,
+}
+
+type Probe = { x: number, z: number }
+
+local PROBES: { Probe } = {
+	{ x = 0, z = 0 },
+	{ x = 1, z = 0 },
+	{ x = -1, z = 0 },
+	{ x = 0, z = 1 },
+	{ x = 0, z = -1 },
+}
+
+local SKIP_STATES: { [Enum.HumanoidStateType]: boolean } = {
+	[Enum.HumanoidStateType.Seated] = true,
+	[Enum.HumanoidStateType.Dead] = true,
+	[Enum.HumanoidStateType.Climbing] = true,
+	[Enum.HumanoidStateType.Swimming] = true,
+	[Enum.HumanoidStateType.PlatformStanding] = true,
+}
+
+local character = script.Parent
+if not character or not character:IsA("Model") then
+	return
+end
+
+local humanoid = character:WaitForChild("Humanoid")
+if not humanoid:IsA("Humanoid") then
+	return
+end
+
+local root = character:WaitForChild("HumanoidRootPart")
+if not root:IsA("BasePart") then
+	return
+end
+
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+rayParams.FilterDescendantsInstances = { character }
+rayParams.RespectCanCollide = true
+rayParams.IgnoreWater = true
+
+local alive = true
+local pending: Pending? = nil
+local lastBounce = -math.huge
+local conns: { RBXScriptConnection } = {}
+
+local function flatUnit(v: Vector3, fallback: Vector3): Vector3
+	local flat = Vector3.new(v.X, 0, v.Z)
+	if flat.Magnitude < 1e-3 then
+		return fallback
+	end
+	return flat.Unit
+end
+
+local function isRampSurface(hit: RaycastResult): boolean
+	local inst = hit.Instance
+	if inst ~= Workspace.Terrain then
+		if not inst:IsA("BasePart") or not inst.CanCollide then
+			return false
+		end
+		local model = inst:FindFirstAncestorOfClass("Model")
+		if model and model:FindFirstChildOfClass("Humanoid") then
+			return false
+		end
+	end
+	local angle = math.deg(math.acos(math.clamp(hit.Normal.Y, -1, 1)))
+	return angle >= CONFIG.MinRampAngle and angle <= CONFIG.MaxRampAngle
+end
+
+local function timeToGap(vy: number, gap: number, g: number): number
+	return (vy + math.sqrt(vy * vy + 2 * g * gap)) / g
+end
+
+local function computeBounce(impactVel: Vector3, n: Vector3, g: number): Vector3?
+	local approach = -impactVel:Dot(n)
+	if approach < CONFIG.MinImpactSpeed then
+		return nil
+	end
+
+	local hx = impactVel.X
+	local hz = impactVel.Z
+	local hv2 = hx * hx + hz * hz
+
+	local targetN = approach * CONFIG.Restitution
+	local horizNormal = hx * n.X + hz * n.Z
+	local vy = (targetN - horizNormal) / math.max(n.Y, 0.1)
+
+	local budget = impactVel.Magnitude * CONFIG.MaxSpeedGain
+	local budgetVy2 = budget * budget - hv2
+	if budgetVy2 <= 0 then
+		return nil
+	end
+
+	local heightCap = math.sqrt(2 * g * CONFIG.MaxBounceHeight)
+	vy = math.min(vy, math.sqrt(budgetVy2), heightCap)
+	if vy < CONFIG.MinVerticalSpeed then
+		return nil
+	end
+
+	return Vector3.new(hx, vy, hz)
+end
+
+local function onPreSimulation(dt: number)
+	pending = nil
+	if not alive or humanoid.Health <= 0 or not root.Parent then
+		return
+	end
+	if SKIP_STATES[humanoid:GetState()] then
+		return
+	end
+
+	local vel = root.AssemblyLinearVelocity
+	if vel.Y > -CONFIG.MinFallSpeed then
+		return
+	end
+	if os.clock() - lastBounce < CONFIG.Cooldown then
+		return
+	end
+
+	local g = math.max(Workspace.Gravity, 1)
+	local rootPos = root.Position
+	local bbCF, bbSize = character:GetBoundingBox()
+	local footDrop = rootPos.Y - (bbCF.Position.Y - bbSize.Y * 0.5)
+	local reach = footDrop - vel.Y * dt + 0.5 * g * dt * dt + CONFIG.ContactTolerance
+
+	local side = flatUnit(root.CFrame.RightVector, Vector3.xAxis) * CONFIG.ProbeSpread
+	local forward = flatUnit(root.CFrame.LookVector, Vector3.zAxis) * CONFIG.ProbeSpread
+	local down = Vector3.new(0, -reach, 0)
+
+	local bestT = math.huge
+	local bestHit: RaycastResult? = nil
+
+	for _, p in PROBES do
+		local origin = rootPos + side * p.x + forward * p.z
+		local hit = Workspace:Raycast(origin, down, rayParams)
+		if not hit or not isRampSurface(hit) then
+			continue
+		end
+		local raw = hit.Distance - footDrop
+		if raw < -CONFIG.ContactTolerance then
+			continue
+		end
+		local t = timeToGap(vel.Y, math.max(raw, 0), g)
+		if t <= dt and t < bestT then
+			bestT = t
+			bestHit = hit
+		end
+	end
+
+	if not bestHit then
+		return
+	end
+
+	local impactVel = Vector3.new(vel.X, vel.Y - g * bestT, vel.Z)
+	local out = computeBounce(impactVel, bestHit.Normal, g)
+	if out then
+		pending = { out = out, normal = bestHit.Normal }
+	end
+end
+
+local function onPostSimulation()
+	local p = pending
+	pending = nil
+	if not p or not alive or not root.Parent or humanoid.Health <= 0 then
+		return
+	end
+
+	if root.AssemblyLinearVelocity:Dot(p.normal) < -CONFIG.ContactNormalSlack then
+		return
+	end
+
+	local now = os.clock()
+	if now - lastBounce < CONFIG.Cooldown then
+		return
+	end
+
+	root.AssemblyLinearVelocity = p.out
+	humanoid:ChangeState(Enum.HumanoidStateType.Freefall)
+	lastBounce = now
+end
+
+local function cleanup()
+	if not alive then
+		return
+	end
+	alive = false
+	pending = nil
+	for _, c in conns do
+		c:Disconnect()
+	end
+	table.clear(conns)
+end
+
+table.insert(conns, RunService.PreSimulation:Connect(onPreSimulation))
+table.insert(conns, RunService.PostSimulation:Connect(onPostSimulation))
+table.insert(conns, humanoid.Died:Connect(cleanup))
+table.insert(conns, character.AncestryChanged:Connect(function(_: Instance, parent: Instance?)
+	if not parent then
+		cleanup()
+	end
+end))
+table.insert(conns, script.Destroying:Connect(cleanup))
